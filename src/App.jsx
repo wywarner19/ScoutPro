@@ -71,6 +71,20 @@ async function sbDeleteTeam(id) {
   if (!res.ok) throw new Error(`Delete failed (${res.status})`);
 }
 
+async function sbFetchGames() {
+  const res = await fetch(`${SUPABASE_URL}/rest/v1/scout_games?select=*`, { headers: SB_HEADERS });
+  if (!res.ok) throw new Error(`Fetch failed (${res.status})`);
+  return res.json(); // [{ id, data, updated_at }]
+}
+async function sbUpsertGame(game) {
+  const res = await fetch(`${SUPABASE_URL}/rest/v1/scout_games?on_conflict=id`, {
+    method: "POST",
+    headers: { ...SB_HEADERS, Prefer: "resolution=merge-duplicates,return=minimal" },
+    body: JSON.stringify({ id: game.id, data: game }),
+  });
+  if (!res.ok) throw new Error(`Save failed (${res.status})`);
+}
+
 // ── ID generator ───────────────────────────────────────────────
 let _id = Date.now();
 const uid = () => (++_id).toString(36);
@@ -80,26 +94,55 @@ const uid = () => (++_id).toString(36);
 // ══════════════════════════════════════════════════════════════
 export default function App() {
   const [teams, setTeams] = useState(() => load("scout_teams", []));
-  const [view, setView] = useState("home"); // home | team | player | live | report
+  const [games, setGames] = useState(() => load("scout_games", []));
+  const [view, setView] = useState("home"); // home | team | player | live | report | gamesetup | livegame
   const [activeTeamId, setActiveTeamId] = useState(null);
   const [activePlayerId, setActivePlayerId] = useState(null);
   const [activeABId, setActiveABId] = useState(null);
-  const [modal, setModal] = useState(null); // "addTeam"|"addPlayer"|"addAB"
+  const [activeGameId, setActiveGameId] = useState(null);
+  const [gameFlow, setGameFlow] = useState(null); // { gameId, side } while tracking an AB from Live Game
+  const [modal, setModal] = useState(null); // "addTeam"|"addPlayer"|"addAB"|"startGame"
   const [syncStatus, setSyncStatus] = useState("connecting"); // connecting | synced | syncing | offline | error
   const syncTimers = useRef({});
+
+  const persistGames = (newGames, changedGameId) => {
+    setGames(newGames);
+    save("scout_games", newGames);
+    if (changedGameId) {
+      const game = newGames.find(g => g.id === changedGameId);
+      const key = `game_${changedGameId}`;
+      if (syncTimers.current[key]) clearTimeout(syncTimers.current[key]);
+      setSyncStatus("syncing");
+      syncTimers.current[key] = setTimeout(async () => {
+        try {
+          if (game) await sbUpsertGame(game);
+          setSyncStatus("synced");
+        } catch (e) {
+          setSyncStatus("error");
+        }
+      }, 700);
+    }
+  };
 
   // ── Initial cloud load (runs once) ─────────────────────────────
   useEffect(() => {
     (async () => {
       try {
-        const rows = await sbFetchTeams();
-        if (rows && rows.length > 0) {
-          const cloudTeams = rows.map(r => r.data);
+        const [teamRows, gameRows] = await Promise.all([sbFetchTeams(), sbFetchGames()]);
+        if (teamRows && teamRows.length > 0) {
+          const cloudTeams = teamRows.map(r => r.data);
           setTeams(cloudTeams);
           save("scout_teams", cloudTeams);
         } else if (teams.length > 0) {
           // Local data exists but cloud is empty — push it up
           for (const t of teams) await sbUpsertTeam(t);
+        }
+        if (gameRows && gameRows.length > 0) {
+          const cloudGames = gameRows.map(r => r.data);
+          setGames(cloudGames);
+          save("scout_games", cloudGames);
+        } else if (games.length > 0) {
+          for (const g of games) await sbUpsertGame(g);
         }
         setSyncStatus("synced");
       } catch (e) {
@@ -129,6 +172,7 @@ export default function App() {
   const activeTeam   = teams.find(t => t.id === activeTeamId);
   const activePlayer = activeTeam?.players?.find(p => p.id === activePlayerId);
   const activeAB     = activePlayer?.abs?.find(a => a.id === activeABId);
+  const activeGame   = games.find(g => g.id === activeGameId);
 
   // ── CRUD ────────────────────────────────────────────────────
   const addTeam = (name) => {
@@ -143,6 +187,7 @@ export default function App() {
       createdAt: Date.now()
     };
     persist(teams.map(t => t.id===teamId ? {...t, players:[...t.players, p]} : t), teamId);
+    return p.id;
   };
   const updatePlayerProfile = (teamId, playerId, profile) => {
     persist(teams.map(t => t.id!==teamId ? t : {
@@ -201,6 +246,77 @@ export default function App() {
     }), teamId);
   };
 
+  // ── LIVE GAME ──────────────────────────────────────────────
+  const startGame = (config) => {
+    // config: { mode: "single"|"matchup", teamAId, teamBId, lineupA: [playerId...], lineupB: [playerId...] }
+    const g = {
+      id: uid(),
+      mode: config.mode,
+      teamAId: config.teamAId,
+      teamBId: config.teamBId || null,
+      lineupA: config.lineupA,
+      lineupB: config.lineupB || [],
+      idxA: 0,
+      idxB: 0,
+      inning: 1,
+      half: config.mode==="matchup" ? "top" : "single",
+      battingSide: config.mode==="matchup" ? "B" : "A", // visitors (B) bat first in a matchup
+      active: true,
+      createdAt: Date.now(),
+    };
+    persistGames([...games.filter(x=>!x.active), g], g.id); // only one active game at a time
+    setActiveGameId(g.id);
+    setView("livegame");
+  };
+  const updateGame = (gameId, patch) => {
+    persistGames(games.map(g => g.id!==gameId ? g : { ...g, ...patch }), gameId);
+  };
+  const advanceLineup = (gameId, side) => {
+    const g = games.find(x=>x.id===gameId);
+    if (!g) return;
+    const key = side==="A" ? "idxA" : "idxB";
+    const lineup = side==="A" ? g.lineupA : g.lineupB;
+    if (!lineup || lineup.length===0) return;
+    updateGame(gameId, { [key]: (g[key]+1) % lineup.length });
+  };
+  const switchSides = (gameId) => {
+    const g = games.find(x=>x.id===gameId);
+    if (!g) return;
+    if (g.battingSide==="B") updateGame(gameId, { battingSide:"A", half:"bottom" });
+    else updateGame(gameId, { battingSide:"B", half:"top", inning: g.inning+1 });
+  };
+  const subInPlayer = (gameId, side, slotIdx, playerId) => {
+    const g = games.find(x=>x.id===gameId);
+    if (!g) return;
+    const key = side==="A" ? "lineupA" : "lineupB";
+    const lineup = [...g[key]];
+    lineup[slotIdx] = playerId;
+    updateGame(gameId, { [key]: lineup });
+  };
+  const endGame = (gameId) => {
+    persistGames(games.map(g => g.id!==gameId ? g : { ...g, active:false }), gameId);
+    setActiveGameId(null);
+    setGameFlow(null);
+    setView("home");
+  };
+  const refreshGame = async (gameId) => {
+    setSyncStatus("syncing");
+    try {
+      const rows = await sbFetchGames();
+      const found = rows.find(r => r.id === gameId);
+      if (found) {
+        setGames(prev => {
+          const next = prev.map(g => g.id === gameId ? found.data : g);
+          save("scout_games", next);
+          return next;
+        });
+      }
+      setSyncStatus("synced");
+    } catch (e) {
+      setSyncStatus("error");
+    }
+  };
+
   // ── NAV ────────────────────────────────────────────────────
   const navTeam       = (id) => { setActiveTeamId(id);   setView("team"); };
   const navPlayer     = (id) => { setActivePlayerId(id);  setView("player"); };
@@ -208,11 +324,33 @@ export default function App() {
   const navTeamReport = ()   => setView("teamreport");
   const navLive       = (abId) => { setActiveABId(abId); setView("live"); };
   const navBack       = () => {
-    if (view==="live")        { setActiveABId(null);    setView("player"); }
+    if (view==="live") {
+      if (gameFlow) { setGameFlow(null); setActiveABId(null); setView("livegame"); }
+      else { setActiveABId(null); setView("player"); }
+    }
     else if (view==="player")     { setActivePlayerId(null); setView("team"); }
     else if (view==="team")       { setActiveTeamId(null);   setView("home"); }
     else if (view==="report")     setView("player");
     else if (view==="teamreport") setView("team");
+    else if (view==="gamesetup")  setView("home");
+    else if (view==="livegame")   { setActiveGameId(null); setGameFlow(null); setView("home"); }
+  };
+
+  // Start tracking the current "now batting" player's at-bat from Live Game
+  const startGameAB = () => {
+    if (!activeGame) return;
+    const side   = activeGame.battingSide;
+    const teamId = side==="A" ? activeGame.teamAId : activeGame.teamBId;
+    const lineup = side==="A" ? activeGame.lineupA : activeGame.lineupB;
+    const idx    = side==="A" ? activeGame.idxA    : activeGame.idxB;
+    const playerId = lineup[idx];
+    if (!teamId || !playerId) return;
+    const abId = addAB(teamId, playerId, { inningStart: activeGame.inning });
+    setActiveTeamId(teamId);
+    setActivePlayerId(playerId);
+    setActiveABId(abId);
+    setGameFlow({ gameId: activeGame.id, side });
+    setView("live");
   };
 
   return (
@@ -221,8 +359,15 @@ export default function App() {
       <TopBar view={view} team={activeTeam} player={activePlayer} onBack={navBack} onReport={navReport} onTeamReport={navTeamReport} syncStatus={syncStatus} />
 
       {/* VIEWS */}
-      {view==="home"       && <HomeView teams={teams} onSelect={navTeam} onAdd={()=>setModal("addTeam")} />}
-      {view==="team"       && activeTeam && <TeamView team={activeTeam} onSelect={navPlayer} onAdd={()=>setModal("addPlayer")} onTeamReport={navTeamReport} onImport={()=>setModal("importStats")} />}
+      {view==="home"       && (
+        <HomeView
+          teams={teams} onSelect={navTeam} onAdd={()=>setModal("addTeam")}
+          activeGame={games.find(g=>g.active)}
+          onResumeGame={(id)=>{ setActiveGameId(id); setView("livegame"); }}
+          onStartGame={()=>setModal("startGame")}
+        />
+      )}
+      {view==="team"       && activeTeam && <TeamView team={activeTeam} onSelect={navPlayer} onAdd={()=>setModal("addPlayer")} onTeamReport={navTeamReport} onImport={()=>setModal("importStats")} onStartGame={()=>setModal("startGame")} />}
       {view==="player"     && activePlayer && activeTeam && (
         <PlayerView
           team={activeTeam} player={activePlayer}
@@ -237,7 +382,17 @@ export default function App() {
         <LiveTrackingView
           team={activeTeam} player={activePlayer} ab={activeAB}
           onAddPitch={(p)=>addPitch(activeTeam.id, activePlayer.id, activeAB.id, p)}
-          onFinishAB={(outcome, inning, fz)=>{ setABOutcome(activeTeam.id, activePlayer.id, activeAB.id, outcome, inning, fz); setView("player"); }}
+          onFinishAB={(outcome, inning, fz)=>{
+            setABOutcome(activeTeam.id, activePlayer.id, activeAB.id, outcome, inning, fz);
+            if (gameFlow) {
+              advanceLineup(gameFlow.gameId, gameFlow.side);
+              setGameFlow(null);
+              setActiveABId(null);
+              setView("livegame");
+            } else {
+              setView("player");
+            }
+          }}
         />
       )}
       {view==="report" && activePlayer && activeTeam && (
@@ -245,6 +400,20 @@ export default function App() {
       )}
       {view==="teamreport" && activeTeam && (
         <TeamReportView team={activeTeam} onBack={navBack} onSelectPlayer={(id)=>{ setActivePlayerId(id); setView("player"); }} />
+      )}
+      {view==="livegame" && activeGame && (
+        <LiveGameView
+          game={activeGame} teams={teams}
+          onTrackAB={startGameAB}
+          onSwitchSides={()=>switchSides(activeGame.id)}
+          onAdvance={(side)=>advanceLineup(activeGame.id, side)}
+          onSetIdx={(side, idx)=>updateGame(activeGame.id, side==="A"?{idxA:idx}:{idxB:idx})}
+          onSub={(side, slotIdx, playerId)=>subInPlayer(activeGame.id, side, slotIdx, playerId)}
+          onAddPlayer={(teamId, info)=>addPlayer(teamId, info)}
+          onEndGame={()=>endGame(activeGame.id)}
+          onRefresh={()=>refreshGame(activeGame.id)}
+          onViewPlayer={(teamId, playerId)=>{ setActiveTeamId(teamId); setActivePlayerId(playerId); setView("player"); }}
+        />
       )}
 
       {/* MODALS */}
@@ -262,6 +431,14 @@ export default function App() {
         <ImportStatsModal
           existingPlayers={activeTeam.players||[]}
           onImport={(rows, source)=>{ importStats(activeTeam.id, rows, source); setModal(null); }}
+          onClose={()=>setModal(null)}
+        />
+      )}
+      {modal==="startGame" && (
+        <StartGameModal
+          teams={teams}
+          defaultTeamId={activeTeamId}
+          onStart={(config)=>{ startGame(config); setModal(null); }}
           onClose={()=>setModal(null)}
         />
       )}
@@ -298,6 +475,7 @@ function TopBar({ view, team, player, onBack, onReport, onTeamReport, syncStatus
 
       {/* Breadcrumb */}
       <div style={{ flex:1, display:"flex", alignItems:"center", gap:6, fontSize:13, color:C.muted, overflow:"hidden" }}>
+        {view==="livegame" && <span style={{ color:C.gold, fontWeight:700 }}>🎮 Live Game</span>}
         {team && <><span style={{ color:C.text, fontWeight:600 }}>{team.name}</span></>}
         {player && <><span>›</span><span style={{ color:C.gold, fontWeight:700 }}>#{player.number} {player.name}</span></>}
       </div>
@@ -325,15 +503,33 @@ function TopBar({ view, team, player, onBack, onReport, onTeamReport, syncStatus
 // ══════════════════════════════════════════════════════════════
 // HOME VIEW
 // ══════════════════════════════════════════════════════════════
-function HomeView({ teams, onSelect, onAdd }) {
+function HomeView({ teams, onSelect, onAdd, activeGame, onResumeGame, onStartGame }) {
   return (
     <div style={{ maxWidth:900, margin:"0 auto", padding:"32px 20px" }}>
-      <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between", marginBottom:28 }}>
+      {activeGame && (
+        <div onClick={()=>onResumeGame(activeGame.id)} style={{ ...cardStyle({hover:true}), marginBottom:20, display:"flex", alignItems:"center", gap:14, border:`1px solid ${C.gold}55`, background:`${C.gold}11` }}>
+          <div style={{ fontSize:28 }}>🎮</div>
+          <div style={{ flex:1 }}>
+            <div style={{ fontSize:11, color:C.gold, textTransform:"uppercase", letterSpacing:2, fontWeight:700 }}>Game In Progress</div>
+            <div style={{ fontSize:16, fontWeight:800 }}>
+              {teams.find(t=>t.id===activeGame.teamAId)?.name || "Team A"}
+              {activeGame.mode==="matchup" && <> vs {teams.find(t=>t.id===activeGame.teamBId)?.name || "Team B"}</>}
+            </div>
+          </div>
+          <div style={{ fontWeight:700, color:C.gold }}>Resume →</div>
+        </div>
+      )}
+      <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between", marginBottom:28, flexWrap:"wrap", gap:12 }}>
         <div>
           <div style={{ fontSize:28, fontWeight:900, letterSpacing:-0.5 }}>Opponent Teams</div>
           <div style={{ fontSize:13, color:C.muted, marginTop:4 }}>{teams.length} team{teams.length!==1?"s":""} scouted</div>
         </div>
-        <button onClick={onAdd} style={btnStyle({ bg:C.accent, color:"#fff", padding:"12px 22px", fontWeight:700 })}>+ Add Team</button>
+        <div style={{ display:"flex", gap:10, flexWrap:"wrap" }}>
+          {!activeGame && teams.length>0 && (
+            <button onClick={onStartGame} style={btnStyle({ bg:C.gold, color:"#000", padding:"12px 22px", fontWeight:700 })}>🎮 Start Game</button>
+          )}
+          <button onClick={onAdd} style={btnStyle({ bg:C.accent, color:"#fff", padding:"12px 22px", fontWeight:700 })}>+ Add Team</button>
+        </div>
       </div>
       {teams.length===0 && (
         <Empty icon="🏟️" title="No teams yet" sub="Add your first opponent team to start scouting" />
@@ -355,7 +551,7 @@ function HomeView({ teams, onSelect, onAdd }) {
 // ══════════════════════════════════════════════════════════════
 // TEAM VIEW
 // ══════════════════════════════════════════════════════════════
-function TeamView({ team, onSelect, onAdd, onTeamReport, onImport }) {
+function TeamView({ team, onSelect, onAdd, onTeamReport, onImport, onStartGame }) {
   const sorted = [...(team.players||[])].sort((a,b) => (a.order||99)-(b.order||99));
   return (
     <div style={{ maxWidth:1000, margin:"0 auto", padding:"32px 20px" }}>
@@ -365,6 +561,7 @@ function TeamView({ team, onSelect, onAdd, onTeamReport, onImport }) {
           <div style={{ fontSize:13, color:C.muted, marginTop:4 }}>{sorted.length} players</div>
         </div>
         <div style={{ display:"flex", gap:10, flexWrap:"wrap" }}>
+          <button onClick={onStartGame} style={btnStyle({ bg:C.gold, color:"#000", padding:"12px 18px", fontWeight:700 })}>🎮 Start Game</button>
           <button onClick={onImport} style={btnStyle({ bg:C.card, color:C.gold, padding:"12px 18px", fontWeight:700 })}>📥 Import Stats</button>
           <button onClick={onTeamReport} style={btnStyle({ bg:C.blue, color:"#fff", padding:"12px 18px", fontWeight:700 })}>📋 Game Day Sheet</button>
           <button onClick={onAdd} style={btnStyle({ bg:C.accent, color:"#fff", padding:"12px 22px", fontWeight:700 })}>+ Add Player</button>
@@ -1779,3 +1976,304 @@ const miniInput = () => ({
   boxSizing: "border-box",
   outline: "none",
 });
+
+// ══════════════════════════════════════════════════════════════
+// LIVE GAME: SETUP MODAL
+// ══════════════════════════════════════════════════════════════
+const defaultLineup = (team) => {
+  const sorted = [...(team?.players||[])].sort((a,b)=>(Number(a.order)||99)-(Number(b.order)||99));
+  const ids = sorted.slice(0,9).map(p=>p.id);
+  while (ids.length < 9) ids.push(null);
+  return ids;
+};
+
+function StartGameModal({ teams, defaultTeamId, onStart, onClose }) {
+  const [mode, setMode] = useState("single"); // single | matchup
+  const [teamAId, setTeamAId] = useState(defaultTeamId || teams[0]?.id || "");
+  const [teamBId, setTeamBId] = useState("");
+  const teamA = teams.find(t=>t.id===teamAId);
+  const teamB = teams.find(t=>t.id===teamBId);
+
+  const [lineupA, setLineupA] = useState(()=>defaultLineup(teamA));
+  const [lineupB, setLineupB] = useState([]);
+
+  // Re-derive default lineup when team selection changes
+  const handleTeamA = (id) => { setTeamAId(id); setLineupA(defaultLineup(teams.find(t=>t.id===id))); };
+  const handleTeamB = (id) => { setTeamBId(id); setLineupB(defaultLineup(teams.find(t=>t.id===id))); };
+
+  const aReady = lineupA.some(Boolean);
+  const bReady = mode==="single" || lineupB.some(Boolean);
+  const canStart = teamAId && aReady && (mode==="single" || (teamBId && bReady && teamBId!==teamAId));
+
+  return (
+    <div style={{ position:"fixed", inset:0, background:"rgba(0,0,0,0.78)", display:"flex", alignItems:"center", justifyContent:"center", zIndex:1000, padding:20 }}>
+      <div style={{ background:C.card, border:`1px solid ${C.border}`, borderRadius:16, padding:28, width:"100%", maxWidth:680, maxHeight:"88vh", overflowY:"auto", boxShadow:"0 24px 64px rgba(0,0,0,0.6)" }}>
+        <div style={{ fontSize:20, fontWeight:800, marginBottom:6 }}>🎮 Start Game</div>
+        <div style={{ fontSize:13, color:C.muted, marginBottom:20 }}>Set up lineups to track at-bats in order. You can sub players in at any time during the game.</div>
+
+        {/* Mode select */}
+        <Field label="Track">
+          <div style={{ display:"flex", gap:8 }}>
+            {[["single","Just one team"],["matchup","Both teams (matchup)"]].map(([m,label])=>(
+              <button key={m} onClick={()=>{ setMode(m); if(m==="single"){ setTeamBId(""); setLineupB([]); } }}
+                style={{ flex:1, padding:"12px", borderRadius:10, border:`2px solid ${mode===m?C.accent:C.border}`, background: mode===m?`${C.accent}22`:"transparent", color: mode===m?C.accent:C.muted, fontWeight:700, cursor:"pointer" }}>
+                {label}
+              </button>
+            ))}
+          </div>
+        </Field>
+
+        {/* Team selectors */}
+        <div style={{ display:"flex", gap:12, marginTop:14 }}>
+          <div style={{ flex:1 }}>
+            <Field label={mode==="matchup" ? "Team A (bats in bottom of inning)" : "Team"}>
+              <select value={teamAId} onChange={e=>handleTeamA(e.target.value)} style={inputStyle()}>
+                <option value="">Select team…</option>
+                {teams.map(t=><option key={t.id} value={t.id}>{t.name}</option>)}
+              </select>
+            </Field>
+          </div>
+          {mode==="matchup" && (
+            <div style={{ flex:1 }}>
+              <Field label="Team B (bats in top of inning)">
+                <select value={teamBId} onChange={e=>handleTeamB(e.target.value)} style={inputStyle()}>
+                  <option value="">Select team…</option>
+                  {teams.filter(t=>t.id!==teamAId).map(t=><option key={t.id} value={t.id}>{t.name}</option>)}
+                </select>
+              </Field>
+            </div>
+          )}
+        </div>
+
+        {/* Lineup builders */}
+        {teamA && (
+          <div style={{ marginTop:18 }}>
+            <SectionLabel>{teamA.name} — Batting Order</SectionLabel>
+            <LineupBuilder team={teamA} lineup={lineupA} onChange={setLineupA} />
+          </div>
+        )}
+        {mode==="matchup" && teamB && (
+          <div style={{ marginTop:18 }}>
+            <SectionLabel>{teamB.name} — Batting Order</SectionLabel>
+            <LineupBuilder team={teamB} lineup={lineupB} onChange={setLineupB} />
+          </div>
+        )}
+
+        <div style={{ display:"flex", gap:10, marginTop:24, justifyContent:"flex-end" }}>
+          <button onClick={onClose} style={btnStyle({ bg:"transparent", color:C.muted, padding:"10px 18px" })}>Cancel</button>
+          <button onClick={()=>canStart && onStart({ mode, teamAId, teamBId: mode==="matchup"?teamBId:null, lineupA: lineupA.filter(Boolean), lineupB: lineupB.filter(Boolean) })}
+            disabled={!canStart}
+            style={{ ...btnStyle({ bg: canStart?C.gold:C.border, color: canStart?"#000":C.muted, padding:"10px 24px", fontWeight:800 }), cursor: canStart?"pointer":"not-allowed" }}>
+            ▶ Start Game
+          </button>
+        </div>
+        {!canStart && teams.length<2 && mode==="matchup" && (
+          <div style={{ marginTop:10, fontSize:12, color:C.muted }}>You need at least two scouted teams to start a matchup.</div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function LineupBuilder({ team, lineup, onChange }) {
+  const players = team.players || [];
+  const setSlot = (i, val) => {
+    const next = [...lineup];
+    next[i] = val || null;
+    onChange(next);
+  };
+  return (
+    <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr 1fr", gap:8 }}>
+      {Array.from({length:9}).map((_,i)=>(
+        <div key={i} style={{ display:"flex", alignItems:"center", gap:6 }}>
+          <div style={{ width:20, fontSize:12, color:C.muted, fontWeight:700, textAlign:"right" }}>{i+1}</div>
+          <select value={lineup[i]||""} onChange={e=>setSlot(i, e.target.value)} style={{...inputStyle(), padding:"8px 8px", fontSize:13}}>
+            <option value="">— empty —</option>
+            {players.map(p=><option key={p.id} value={p.id}>#{p.number} {p.name}</option>)}
+          </select>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+// ══════════════════════════════════════════════════════════════
+// LIVE GAME VIEW
+// ══════════════════════════════════════════════════════════════
+const getPlayer = (teams, teamId, playerId) => {
+  const team = teams.find(t=>t.id===teamId);
+  return team?.players?.find(p=>p.id===playerId);
+};
+
+function LiveGameView({ game, teams, onTrackAB, onSwitchSides, onAdvance, onSetIdx, onSub, onAddPlayer, onEndGame, onRefresh, onViewPlayer }) {
+  const [subTarget, setSubTarget] = useState(null); // { side, slotIdx }
+  const teamA = teams.find(t=>t.id===game.teamAId);
+  const teamB = teams.find(t=>t.id===game.teamBId);
+  const isMatchup = game.mode==="matchup";
+
+  const side = game.battingSide;
+  const battingTeam = side==="A" ? teamA : teamB;
+  const lineup = side==="A" ? game.lineupA : game.lineupB;
+  const idx = side==="A" ? game.idxA : game.idxB;
+  const currentPlayer = getPlayer(teams, battingTeam?.id, lineup[idx]);
+
+  const inningLabel = !isMatchup ? `Inning ${game.inning}`
+    : `${game.half==="top"?"Top":"Bottom"} ${game.inning}`;
+
+  return (
+    <div style={{ maxWidth:1000, margin:"0 auto", padding:"20px 16px" }}>
+      {/* Header */}
+      <div style={{ background:C.surface, border:`1px solid ${C.border}`, borderRadius:14, padding:16, marginBottom:16, display:"flex", alignItems:"center", gap:16, flexWrap:"wrap" }}>
+        <div>
+          <div style={{ fontSize:11, color:C.muted, textTransform:"uppercase", letterSpacing:2 }}>{isMatchup ? "Matchup" : "Single Team"} · {inningLabel}</div>
+          <div style={{ fontSize:18, fontWeight:800 }}>
+            {teamA?.name}{isMatchup && <> <span style={{ color:C.muted, fontWeight:400 }}>vs</span> {teamB?.name}</>}
+          </div>
+        </div>
+        <div style={{ flex:1 }} />
+        {isMatchup && (
+          <button onClick={onSwitchSides} style={btnStyle({ bg:C.blue, color:"#fff", padding:"10px 16px", fontWeight:700 })}>⇆ Switch Sides</button>
+        )}
+        <button onClick={onRefresh} title="Pull latest from cloud (use if you switched devices)" style={btnStyle({ bg:C.card, color:C.muted, padding:"10px 14px", fontWeight:700 })}>↻ Refresh</button>
+        <button onClick={onEndGame} style={btnStyle({ bg:C.accent, color:"#fff", padding:"10px 16px", fontWeight:700 })}>■ End Game</button>
+      </div>
+
+      {/* Now Batting */}
+      <div style={{ ...cardStyle(), marginBottom:16, background:`linear-gradient(135deg, ${C.card}, ${C.surface})`, border:`1px solid ${C.gold}44` }}>
+        <SectionLabel>
+          Now Batting{isMatchup && <span style={{ color:C.gold }}> · {battingTeam?.name}</span>}
+        </SectionLabel>
+        {currentPlayer ? (
+          <div style={{ display:"flex", alignItems:"center", gap:18, flexWrap:"wrap" }}>
+            <div style={{ width:60, height:60, borderRadius:12, background:`linear-gradient(135deg,${C.accentDim},${C.accent})`, display:"flex", alignItems:"center", justifyContent:"center", fontSize:24, fontWeight:900 }}>
+              {currentPlayer.number}
+            </div>
+            <div style={{ flex:1 }}>
+              <div style={{ fontSize:24, fontWeight:900 }}>{currentPlayer.name}</div>
+              <div style={{ fontSize:13, color:C.muted }}>
+                Batting #{idx+1} · Bats {currentPlayer.bats||"R"}
+                {currentPlayer.profile?.willSteal==="Yes" && <> · <span style={{ color:C.green, fontWeight:700 }}>SB Threat</span></>}
+                {currentPlayer.profile?.firstPitchSwinger==="Yes" && <> · <span style={{ color:C.gold, fontWeight:700 }}>1st Pitch Swinger</span></>}
+              </div>
+            </div>
+            <button onClick={()=>onViewPlayer(battingTeam.id, currentPlayer.id)} style={btnStyle({ bg:C.card, color:C.text, padding:"10px 16px", fontWeight:600 })}>View Profile</button>
+            <button onClick={onTrackAB} style={btnStyle({ bg:C.gold, color:"#000", padding:"14px 28px", fontWeight:800, fontSize:15 })}>▶ Track At-Bat</button>
+          </div>
+        ) : (
+          <div style={{ color:C.muted }}>No player in this lineup spot — tap Sub below to fill it.</div>
+        )}
+      </div>
+
+      {/* Lineups */}
+      <div style={{ display:"grid", gridTemplateColumns: isMatchup ? "1fr 1fr" : "1fr", gap:16 }}>
+        <LineupCard
+          team={teamA} lineup={game.lineupA} idx={game.idxA} active={side==="A"}
+          onJump={(i)=>onSetIdx("A",i)} onSub={(i)=>setSubTarget({side:"A", slotIdx:i})}
+          teams={teams} onViewPlayer={onViewPlayer}
+        />
+        {isMatchup && (
+          <LineupCard
+            team={teamB} lineup={game.lineupB} idx={game.idxB} active={side==="B"}
+            onJump={(i)=>onSetIdx("B",i)} onSub={(i)=>setSubTarget({side:"B", slotIdx:i})}
+            teams={teams} onViewPlayer={onViewPlayer}
+          />
+        )}
+      </div>
+
+      {subTarget && (
+        <SubModal
+          team={subTarget.side==="A" ? teamA : teamB}
+          onPick={(playerId)=>{ onSub(subTarget.side, subTarget.slotIdx, playerId); setSubTarget(null); }}
+          onAddPlayer={onAddPlayer}
+          onClose={()=>setSubTarget(null)}
+        />
+      )}
+    </div>
+  );
+}
+
+function LineupCard({ team, lineup, idx, active, onJump, onSub, teams, onViewPlayer }) {
+  return (
+    <div style={cardStyle()}>
+      <SectionLabel>
+        {team?.name} Lineup {active && <span style={{ color:C.gold }}>· Up Now</span>}
+      </SectionLabel>
+      <div style={{ display:"flex", flexDirection:"column", gap:6 }}>
+        {lineup.map((playerId,i)=>{
+          const player = getPlayer(teams, team?.id, playerId);
+          const isCurrent = active && i===idx;
+          return (
+            <div key={i} style={{ display:"flex", alignItems:"center", gap:10, padding:"8px 10px", borderRadius:8, background: isCurrent?`${C.gold}22`:C.bg, border:`1px solid ${isCurrent?C.gold:C.border}` }}>
+              <div style={{ width:20, fontSize:12, fontWeight:800, color:isCurrent?C.gold:C.muted, textAlign:"center" }}>{i+1}</div>
+              {player ? (
+                <div onClick={()=>onViewPlayer(team.id, player.id)} style={{ flex:1, cursor:"pointer" }}>
+                  <span style={{ fontWeight:700 }}>#{player.number} {player.name}</span>
+                  <span style={{ color:C.muted, fontSize:12 }}> · {player.bats||"R"}</span>
+                </div>
+              ) : (
+                <div style={{ flex:1, color:C.muted, fontStyle:"italic" }}>empty</div>
+              )}
+              {!isCurrent && (
+                <button onClick={()=>onJump(i)} title="Jump to this batter" style={{ background:"transparent", border:`1px solid ${C.border}`, color:C.muted, borderRadius:6, padding:"4px 8px", fontSize:11, cursor:"pointer" }}>Set Up Next</button>
+              )}
+              <button onClick={()=>onSub(i)} style={{ background:"transparent", border:`1px solid ${C.border}`, color:C.blue, borderRadius:6, padding:"4px 8px", fontSize:11, cursor:"pointer", fontWeight:700 }}>Sub</button>
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+function SubModal({ team, onPick, onAddPlayer, onClose }) {
+  const [tab, setTab] = useState("existing"); // existing | new
+  const [newPlayer, setNewPlayer] = useState({ name:"", number:"", bats:"R" });
+  const players = team?.players || [];
+
+  const confirmNew = () => {
+    if (!newPlayer.name.trim() || !newPlayer.number.trim()) return;
+    const id = onAddPlayer(team.id, { ...newPlayer, order:"", gradYear:"" });
+    onPick(id);
+  };
+
+  return (
+    <div style={{ position:"fixed", inset:0, background:"rgba(0,0,0,0.78)", display:"flex", alignItems:"center", justifyContent:"center", zIndex:1100, padding:20 }}>
+      <div style={{ background:C.card, border:`1px solid ${C.border}`, borderRadius:16, padding:24, width:"100%", maxWidth:420, maxHeight:"80vh", overflowY:"auto", boxShadow:"0 24px 64px rgba(0,0,0,0.6)" }}>
+        <div style={{ fontSize:18, fontWeight:800, marginBottom:14 }}>Substitute Player</div>
+        <div style={{ display:"flex", gap:4, marginBottom:14, background:C.bg, borderRadius:8, padding:4 }}>
+          {[["existing","From Roster"],["new","New Player"]].map(([t,label])=>(
+            <button key={t} onClick={()=>setTab(t)} style={{ flex:1, padding:"8px 0", borderRadius:6, border:"none", cursor:"pointer", fontWeight:700, fontSize:13, background: tab===t?C.accent:"transparent", color: tab===t?"#fff":C.muted }}>{label}</button>
+          ))}
+        </div>
+        {tab==="existing" ? (
+          <div style={{ display:"flex", flexDirection:"column", gap:6, maxHeight:280, overflowY:"auto" }}>
+            {players.map(p=>(
+              <button key={p.id} onClick={()=>onPick(p.id)} style={{ textAlign:"left", padding:"10px 12px", borderRadius:8, border:`1px solid ${C.border}`, background:C.bg, color:C.text, cursor:"pointer", fontSize:14 }}>
+                <span style={{ fontWeight:700 }}>#{p.number}</span> {p.name} <span style={{ color:C.muted, fontSize:12 }}>· {p.bats||"R"}</span>
+              </button>
+            ))}
+            {players.length===0 && <div style={{ color:C.muted, fontSize:13 }}>No other players on this roster yet.</div>}
+          </div>
+        ) : (
+          <div style={{ display:"flex", flexDirection:"column", gap:12 }}>
+            <Field label="Name"><input value={newPlayer.name} onChange={e=>setNewPlayer({...newPlayer,name:e.target.value})} placeholder="Full name" style={inputStyle()} /></Field>
+            <Field label="Jersey #"><input value={newPlayer.number} onChange={e=>setNewPlayer({...newPlayer,number:e.target.value})} placeholder="e.g. 14" style={inputStyle()} /></Field>
+            <Field label="Bats">
+              <div style={{ display:"flex", gap:8 }}>
+                {["R","L","S"].map(b=>(
+                  <button key={b} onClick={()=>setNewPlayer({...newPlayer,bats:b})}
+                    style={{ flex:1, padding:"10px", borderRadius:8, border:`2px solid ${newPlayer.bats===b?C.accent:C.border}`, background: newPlayer.bats===b?`${C.accent}22`:"transparent", color:newPlayer.bats===b?C.accent:C.muted, fontWeight:700, cursor:"pointer" }}>{b}</button>
+                ))}
+              </div>
+            </Field>
+            <button onClick={confirmNew} disabled={!newPlayer.name.trim()||!newPlayer.number.trim()}
+              style={{ ...btnStyle({ bg: newPlayer.name.trim()&&newPlayer.number.trim() ? C.green : C.border, color: newPlayer.name.trim()&&newPlayer.number.trim() ? "#000":C.muted, padding:"12px", fontWeight:800 }), cursor: newPlayer.name.trim()&&newPlayer.number.trim()?"pointer":"not-allowed" }}>
+              + Add & Sub In
+            </button>
+          </div>
+        )}
+        <button onClick={onClose} style={{ ...btnStyle({ bg:"transparent", color:C.muted, padding:"10px 0" }), marginTop:14, width:"100%" }}>Cancel</button>
+      </div>
+    </div>
+  );
+}
