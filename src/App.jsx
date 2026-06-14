@@ -84,6 +84,12 @@ async function sbUpsertGame(game) {
   });
   if (!res.ok) throw new Error(`Save failed (${res.status})`);
 }
+async function sbDeleteGame(id) {
+  const res = await fetch(`${SUPABASE_URL}/rest/v1/scout_games?id=eq.${id}`, {
+    method: "DELETE", headers: SB_HEADERS,
+  });
+  if (!res.ok) throw new Error(`Delete failed (${res.status})`);
+}
 
 // ── ID generator ───────────────────────────────────────────────
 let _id = Date.now();
@@ -101,6 +107,7 @@ export default function App() {
   const [activeABId, setActiveABId] = useState(null);
   const [activeGameId, setActiveGameId] = useState(null);
   const [gameFlow, setGameFlow] = useState(null); // { gameId, side } while tracking an AB from Live Game
+  const [reportPlayerIds, setReportPlayerIds] = useState(null); // null = all players, array = filtered subset for a custom report
   const [modal, setModal] = useState(null); // "addTeam"|"addPlayer"|"addAB"|"startGame"
   const [syncStatus, setSyncStatus] = useState("connecting"); // connecting | synced | syncing | offline | error
   const syncTimers = useRef({});
@@ -238,6 +245,34 @@ export default function App() {
       })
     }), teamId);
   };
+  const deleteTeam = async (teamId) => {
+    const next = teams.filter(t => t.id !== teamId);
+    setTeams(next);
+    save("scout_teams", next);
+    setSyncStatus("syncing");
+    try {
+      await sbDeleteTeam(teamId);
+      setSyncStatus("synced");
+    } catch (e) {
+      setSyncStatus("error");
+    }
+    // Also remove any games referencing this team
+    const remainingGames = games.filter(g => g.teamAId!==teamId && g.teamBId!==teamId);
+    if (remainingGames.length !== games.length) {
+      setGames(remainingGames);
+      save("scout_games", remainingGames);
+      const removed = games.filter(g => g.teamAId===teamId || g.teamBId===teamId);
+      for (const g of removed) { try { await sbDeleteGame(g.id); } catch(e){} }
+      if (activeGameId && removed.some(g=>g.id===activeGameId)) { setActiveGameId(null); setGameFlow(null); }
+    }
+  };
+
+  const deletePlayer = (teamId, playerId) => {
+    persist(teams.map(t => t.id!==teamId ? t : {
+      ...t, players: t.players.filter(p => p.id!==playerId)
+    }), teamId);
+  };
+
   const deleteAB = (teamId, playerId, abId) => {
     persist(teams.map(t => t.id!==teamId ? t : {
       ...t, players: t.players.map(p => p.id!==playerId ? p : {
@@ -316,12 +351,25 @@ export default function App() {
       setSyncStatus("error");
     }
   };
+  const deleteGame = async (gameId) => {
+    const next = games.filter(g => g.id !== gameId);
+    setGames(next);
+    save("scout_games", next);
+    if (activeGameId === gameId) { setActiveGameId(null); setGameFlow(null); setView("home"); }
+    setSyncStatus("syncing");
+    try {
+      await sbDeleteGame(gameId);
+      setSyncStatus("synced");
+    } catch (e) {
+      setSyncStatus("error");
+    }
+  };
 
   // ── NAV ────────────────────────────────────────────────────
   const navTeam       = (id) => { setActiveTeamId(id);   setView("team"); };
   const navPlayer     = (id) => { setActivePlayerId(id);  setView("player"); };
   const navReport     = ()   => setView("report");
-  const navTeamReport = ()   => setView("teamreport");
+  const navTeamReport = (playerIds) => { setReportPlayerIds(playerIds || null); setView("teamreport"); };
   const navLive       = (abId) => { setActiveABId(abId); setView("live"); };
   const navBack       = () => {
     if (view==="live") {
@@ -331,7 +379,7 @@ export default function App() {
     else if (view==="player")     { setActivePlayerId(null); setView("team"); }
     else if (view==="team")       { setActiveTeamId(null);   setView("home"); }
     else if (view==="report")     setView("player");
-    else if (view==="teamreport") setView("team");
+    else if (view==="teamreport") { setReportPlayerIds(null); setView("team"); }
     else if (view==="gamesetup")  setView("home");
     else if (view==="livegame")   { setActiveGameId(null); setGameFlow(null); setView("home"); }
   };
@@ -362,12 +410,15 @@ export default function App() {
       {view==="home"       && (
         <HomeView
           teams={teams} onSelect={navTeam} onAdd={()=>setModal("addTeam")}
+          games={games}
           activeGame={games.find(g=>g.active)}
           onResumeGame={(id)=>{ setActiveGameId(id); setView("livegame"); }}
           onStartGame={()=>setModal("startGame")}
+          onDeleteGame={deleteGame}
+          onDeleteTeam={deleteTeam}
         />
       )}
-      {view==="team"       && activeTeam && <TeamView team={activeTeam} onSelect={navPlayer} onAdd={()=>setModal("addPlayer")} onTeamReport={navTeamReport} onImport={()=>setModal("importStats")} onStartGame={()=>setModal("startGame")} />}
+      {view==="team"       && activeTeam && <TeamView team={activeTeam} onSelect={navPlayer} onAdd={()=>setModal("addPlayer")} onTeamReport={navTeamReport} onImport={()=>setModal("importStats")} onStartGame={()=>setModal("startGame")} onDeletePlayer={(playerId)=>deletePlayer(activeTeam.id, playerId)} />}
       {view==="player"     && activePlayer && activeTeam && (
         <PlayerView
           team={activeTeam} player={activePlayer}
@@ -399,7 +450,7 @@ export default function App() {
         <ReportView team={activeTeam} player={activePlayer} onBack={navBack} />
       )}
       {view==="teamreport" && activeTeam && (
-        <TeamReportView team={activeTeam} onBack={navBack} onSelectPlayer={(id)=>{ setActivePlayerId(id); setView("player"); }} />
+        <TeamReportView team={activeTeam} onBack={navBack} onSelectPlayer={(id)=>{ setActivePlayerId(id); setView("player"); }} playerIds={reportPlayerIds} />
       )}
       {view==="livegame" && activeGame && (
         <LiveGameView
@@ -411,6 +462,7 @@ export default function App() {
           onSub={(side, slotIdx, playerId)=>subInPlayer(activeGame.id, side, slotIdx, playerId)}
           onAddPlayer={(teamId, info)=>addPlayer(teamId, info)}
           onEndGame={()=>endGame(activeGame.id)}
+          onDeleteGame={()=>deleteGame(activeGame.id)}
           onRefresh={()=>refreshGame(activeGame.id)}
           onViewPlayer={(teamId, playerId)=>{ setActiveTeamId(teamId); setActivePlayerId(playerId); setView("player"); }}
         />
@@ -503,20 +555,33 @@ function TopBar({ view, team, player, onBack, onReport, onTeamReport, syncStatus
 // ══════════════════════════════════════════════════════════════
 // HOME VIEW
 // ══════════════════════════════════════════════════════════════
-function HomeView({ teams, onSelect, onAdd, activeGame, onResumeGame, onStartGame }) {
+function HomeView({ teams, onSelect, onAdd, games, activeGame, onResumeGame, onStartGame, onDeleteGame }) {
+  const [confirmDelete, setConfirmDelete] = useState(null); // gameId
+  const pastGames = (games||[]).filter(g=>!g.active).sort((a,b)=>(b.createdAt||0)-(a.createdAt||0));
+
   return (
     <div style={{ maxWidth:900, margin:"0 auto", padding:"32px 20px" }}>
       {activeGame && (
-        <div onClick={()=>onResumeGame(activeGame.id)} style={{ ...cardStyle({hover:true}), marginBottom:20, display:"flex", alignItems:"center", gap:14, border:`1px solid ${C.gold}55`, background:`${C.gold}11` }}>
-          <div style={{ fontSize:28 }}>🎮</div>
-          <div style={{ flex:1 }}>
-            <div style={{ fontSize:11, color:C.gold, textTransform:"uppercase", letterSpacing:2, fontWeight:700 }}>Game In Progress</div>
-            <div style={{ fontSize:16, fontWeight:800 }}>
-              {teams.find(t=>t.id===activeGame.teamAId)?.name || "Team A"}
-              {activeGame.mode==="matchup" && <> vs {teams.find(t=>t.id===activeGame.teamBId)?.name || "Team B"}</>}
+        <div style={{ ...cardStyle(), marginBottom:20, display:"flex", alignItems:"center", gap:14, border:`1px solid ${C.gold}55`, background:`${C.gold}11` }}>
+          <div onClick={()=>onResumeGame(activeGame.id)} style={{ display:"flex", alignItems:"center", gap:14, flex:1, cursor:"pointer" }}>
+            <div style={{ fontSize:28 }}>🎮</div>
+            <div style={{ flex:1 }}>
+              <div style={{ fontSize:11, color:C.gold, textTransform:"uppercase", letterSpacing:2, fontWeight:700 }}>Game In Progress</div>
+              <div style={{ fontSize:16, fontWeight:800 }}>
+                {teams.find(t=>t.id===activeGame.teamAId)?.name || "Team A"}
+                {activeGame.mode==="matchup" && <> vs {teams.find(t=>t.id===activeGame.teamBId)?.name || "Team B"}</>}
+              </div>
             </div>
+            <div style={{ fontWeight:700, color:C.gold }}>Resume →</div>
           </div>
-          <div style={{ fontWeight:700, color:C.gold }}>Resume →</div>
+          {confirmDelete===activeGame.id ? (
+            <div style={{ display:"flex", gap:6 }}>
+              <button onClick={()=>{onDeleteGame(activeGame.id); setConfirmDelete(null);}} style={btnStyle({ bg:C.accent, color:"#fff", padding:"8px 12px", fontSize:12, fontWeight:700 })}>Delete</button>
+              <button onClick={()=>setConfirmDelete(null)} style={btnStyle({ bg:"transparent", color:C.muted, padding:"8px 12px", fontSize:12 })}>Cancel</button>
+            </div>
+          ) : (
+            <button onClick={()=>setConfirmDelete(activeGame.id)} style={{ background:"transparent", border:"none", color:C.muted, cursor:"pointer", fontSize:18, padding:"4px 8px" }}>🗑</button>
+          )}
         </div>
       )}
       <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between", marginBottom:28, flexWrap:"wrap", gap:12 }}>
@@ -536,14 +601,57 @@ function HomeView({ teams, onSelect, onAdd, activeGame, onResumeGame, onStartGam
       )}
       <div style={{ display:"grid", gridTemplateColumns:"repeat(auto-fill,minmax(260px,1fr))", gap:16 }}>
         {teams.map(t => (
-          <div key={t.id} onClick={()=>onSelect(t.id)} style={cardStyle({ hover:true })}>
-            <div style={{ fontSize:11, color:C.muted, textTransform:"uppercase", letterSpacing:2, marginBottom:6 }}>Team</div>
-            <div style={{ fontSize:22, fontWeight:800 }}>{t.name}</div>
-            <div style={{ marginTop:10, fontSize:13, color:C.muted }}>{t.players?.length||0} players scouted</div>
-            <div style={{ marginTop:12, height:2, background:`linear-gradient(90deg,${C.accent},transparent)`, borderRadius:1 }} />
+          <div key={t.id} style={{ ...cardStyle(), position:"relative" }}>
+            <div onClick={()=>onSelect(t.id)} style={{ cursor:"pointer" }}>
+              <div style={{ fontSize:11, color:C.muted, textTransform:"uppercase", letterSpacing:2, marginBottom:6 }}>Team</div>
+              <div style={{ fontSize:22, fontWeight:800, paddingRight:28 }}>{t.name}</div>
+              <div style={{ marginTop:10, fontSize:13, color:C.muted }}>{t.players?.length||0} players scouted</div>
+              <div style={{ marginTop:12, height:2, background:`linear-gradient(90deg,${C.accent},transparent)`, borderRadius:1 }} />
+            </div>
+            {confirmDelete===`team-${t.id}` ? (
+              <div style={{ display:"flex", gap:6, marginTop:12 }}>
+                <button onClick={(e)=>{e.stopPropagation(); onDeleteTeam(t.id); setConfirmDelete(null);}} style={btnStyle({ bg:C.accent, color:"#fff", padding:"8px 12px", fontSize:12, fontWeight:700 })}>Delete Team</button>
+                <button onClick={(e)=>{e.stopPropagation(); setConfirmDelete(null);}} style={btnStyle({ bg:"transparent", color:C.muted, padding:"8px 12px", fontSize:12 })}>Cancel</button>
+              </div>
+            ) : (
+              <button onClick={(e)=>{e.stopPropagation(); setConfirmDelete(`team-${t.id}`);}} style={{ position:"absolute", top:14, right:14, background:"transparent", border:"none", color:C.muted, cursor:"pointer", fontSize:18, padding:"2px 6px" }}>🗑</button>
+            )}
           </div>
         ))}
       </div>
+
+      {pastGames.length > 0 && (
+        <div style={{ marginTop:36 }}>
+          <div style={{ fontSize:16, fontWeight:800, marginBottom:12, color:C.muted }}>Game History</div>
+          <div style={{ display:"flex", flexDirection:"column", gap:8 }}>
+            {pastGames.map(g => {
+              const tA = teams.find(t=>t.id===g.teamAId);
+              const tB = teams.find(t=>t.id===g.teamBId);
+              return (
+                <div key={g.id} style={{ ...cardStyle(), display:"flex", alignItems:"center", gap:14, padding:"12px 16px" }}>
+                  <div style={{ fontSize:20 }}>🏁</div>
+                  <div style={{ flex:1 }}>
+                    <div style={{ fontWeight:700 }}>
+                      {tA?.name || "Unknown"}{g.mode==="matchup" && tB && <> vs {tB.name}</>}
+                    </div>
+                    <div style={{ fontSize:12, color:C.muted }}>
+                      {g.mode==="matchup" ? "Matchup" : "Single Team"} · {g.createdAt ? new Date(g.createdAt).toLocaleDateString() : ""}
+                    </div>
+                  </div>
+                  {confirmDelete===g.id ? (
+                    <div style={{ display:"flex", gap:6 }}>
+                      <button onClick={()=>{onDeleteGame(g.id); setConfirmDelete(null);}} style={btnStyle({ bg:C.accent, color:"#fff", padding:"8px 12px", fontSize:12, fontWeight:700 })}>Delete</button>
+                      <button onClick={()=>setConfirmDelete(null)} style={btnStyle({ bg:"transparent", color:C.muted, padding:"8px 12px", fontSize:12 })}>Cancel</button>
+                    </div>
+                  ) : (
+                    <button onClick={()=>setConfirmDelete(g.id)} style={{ background:"transparent", border:"none", color:C.muted, cursor:"pointer", fontSize:18, padding:"4px 8px" }}>🗑</button>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      )}
     </div>
   );
 }
@@ -551,8 +659,16 @@ function HomeView({ teams, onSelect, onAdd, activeGame, onResumeGame, onStartGam
 // ══════════════════════════════════════════════════════════════
 // TEAM VIEW
 // ══════════════════════════════════════════════════════════════
-function TeamView({ team, onSelect, onAdd, onTeamReport, onImport, onStartGame }) {
+function TeamView({ team, onSelect, onAdd, onTeamReport, onImport, onStartGame, onDeletePlayer }) {
   const sorted = [...(team.players||[])].sort((a,b) => (a.order||99)-(b.order||99));
+  const [selectMode, setSelectMode] = useState(false);
+  const [selected, setSelected] = useState([]);
+  const [confirmDelete, setConfirmDelete] = useState(null); // playerId
+
+  const toggleSelect = (id) => setSelected(sel => sel.includes(id) ? sel.filter(x=>x!==id) : [...sel, id]);
+
+  const exitSelectMode = () => { setSelectMode(false); setSelected([]); };
+
   return (
     <div style={{ maxWidth:1000, margin:"0 auto", padding:"32px 20px" }}>
       <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between", marginBottom:28, flexWrap:"wrap", gap:12 }}>
@@ -561,46 +677,91 @@ function TeamView({ team, onSelect, onAdd, onTeamReport, onImport, onStartGame }
           <div style={{ fontSize:13, color:C.muted, marginTop:4 }}>{sorted.length} players</div>
         </div>
         <div style={{ display:"flex", gap:10, flexWrap:"wrap" }}>
-          <button onClick={onStartGame} style={btnStyle({ bg:C.gold, color:"#000", padding:"12px 18px", fontWeight:700 })}>🎮 Start Game</button>
-          <button onClick={onImport} style={btnStyle({ bg:C.card, color:C.gold, padding:"12px 18px", fontWeight:700 })}>📥 Import Stats</button>
-          <button onClick={onTeamReport} style={btnStyle({ bg:C.blue, color:"#fff", padding:"12px 18px", fontWeight:700 })}>📋 Game Day Sheet</button>
-          <button onClick={onAdd} style={btnStyle({ bg:C.accent, color:"#fff", padding:"12px 22px", fontWeight:700 })}>+ Add Player</button>
+          {selectMode ? (
+            <>
+              <button onClick={()=>onTeamReport(selected)} disabled={selected.length===0}
+                style={{ ...btnStyle({ bg: selected.length?C.blue:C.border, color: selected.length?"#fff":C.muted, padding:"12px 18px", fontWeight:700 }), cursor: selected.length?"pointer":"not-allowed" }}>
+                📋 Create Report ({selected.length})
+              </button>
+              <button onClick={exitSelectMode} style={btnStyle({ bg:C.card, color:C.muted, padding:"12px 18px", fontWeight:700 })}>Cancel</button>
+            </>
+          ) : (
+            <>
+              <button onClick={onStartGame} style={btnStyle({ bg:C.gold, color:"#000", padding:"12px 18px", fontWeight:700 })}>🎮 Start Game</button>
+              <button onClick={onImport} style={btnStyle({ bg:C.card, color:C.gold, padding:"12px 18px", fontWeight:700 })}>📥 Import Stats</button>
+              <button onClick={()=>setSelectMode(true)} style={btnStyle({ bg:C.card, color:C.blue, padding:"12px 18px", fontWeight:700 })}>☑️ Select Players</button>
+              <button onClick={()=>onTeamReport()} style={btnStyle({ bg:C.blue, color:"#fff", padding:"12px 18px", fontWeight:700 })}>📋 Game Day Sheet</button>
+              <button onClick={onAdd} style={btnStyle({ bg:C.accent, color:"#fff", padding:"12px 22px", fontWeight:700 })}>+ Add Player</button>
+            </>
+          )}
         </div>
       </div>
+      {selectMode && (
+        <div style={{ fontSize:13, color:C.muted, marginBottom:16 }}>Tap players to include them in a custom report, then tap "Create Report."</div>
+      )}
       {sorted.length===0 && <Empty icon="⚾" title="No players yet" sub="Add hitters to start building scouting reports" />}
       <div style={{ display:"grid", gridTemplateColumns:"repeat(auto-fill,minmax(280px,1fr))", gap:14 }}>
-        {sorted.map(p => <PlayerCard key={p.id} player={p} onClick={()=>onSelect(p.id)} />)}
+        {sorted.map(p => (
+          <PlayerCard
+            key={p.id} player={p}
+            onClick={()=> selectMode ? toggleSelect(p.id) : onSelect(p.id)}
+            selectMode={selectMode}
+            selected={selected.includes(p.id)}
+            confirmDelete={confirmDelete===p.id}
+            onAskDelete={()=>setConfirmDelete(p.id)}
+            onCancelDelete={()=>setConfirmDelete(null)}
+            onConfirmDelete={()=>{ onDeletePlayer(p.id); setConfirmDelete(null); }}
+          />
+        ))}
       </div>
     </div>
   );
 }
 
-function PlayerCard({ player: p, onClick }) {
+function PlayerCard({ player: p, onClick, selectMode, selected, confirmDelete, onAskDelete, onCancelDelete, onConfirmDelete }) {
   const abCount = p.abs?.length || 0;
   const hits = p.abs?.filter(a => ["Single","Double","Triple","HR"].includes(a.outcome)).length || 0;
   const tracked = abCount > 0;
   const avg  = tracked ? (hits/abCount).toFixed(3).replace("0.","." ) : (p.seasonStats?.avg ? Number(p.seasonStats.avg).toFixed(3).replace("0.","." ) : ".000");
   const displayAB = tracked ? abCount : (p.seasonStats?.ab ?? 0);
   return (
-    <div onClick={onClick} style={cardStyle({ hover:true })}>
+    <div onClick={onClick} style={{ ...cardStyle({ hover:true }), position:"relative", border: selected?`2px solid ${C.blue}`:cardStyle().border, background: selected?`${C.blue}11`:C.card }}>
       <div style={{ display:"flex", alignItems:"flex-start", justifyContent:"space-between" }}>
         <div>
           <div style={{ fontSize:11, color:C.muted, textTransform:"uppercase", letterSpacing:2 }}>
             {p.gradYear ? `'${p.gradYear.toString().slice(-2)}` : ""} · {p.bats||"R"} · {p.order ? `#${p.order} in order` : ""}
           </div>
-          <div style={{ fontSize:22, fontWeight:800, marginTop:4 }}>{p.name}</div>
+          <div style={{ fontSize:22, fontWeight:800, marginTop:4, paddingRight: selectMode?28:0 }}>{p.name}</div>
           <div style={{ fontSize:13, color:C.muted }}>#{p.number}</div>
         </div>
-        <div style={{ textAlign:"right" }}>
-          <div style={{ fontSize:24, fontWeight:900, color:C.gold, fontVariantNumeric:"tabular-nums" }}>{avg}</div>
-          <div style={{ fontSize:11, color:C.muted }}>{tracked ? "AVG · tracked" : p.seasonStats ? "AVG · season" : "AVG"} · {displayAB} AB</div>
-        </div>
+        {selectMode ? (
+          <div style={{ width:26, height:26, borderRadius:6, border:`2px solid ${selected?C.blue:C.border}`, background: selected?C.blue:"transparent", display:"flex", alignItems:"center", justifyContent:"center", fontSize:14, fontWeight:900, color:"#fff", flexShrink:0 }}>
+            {selected ? "✓" : ""}
+          </div>
+        ) : (
+          <div style={{ textAlign:"right" }}>
+            <div style={{ fontSize:24, fontWeight:900, color:C.gold, fontVariantNumeric:"tabular-nums" }}>{avg}</div>
+            <div style={{ fontSize:11, color:C.muted }}>{tracked ? "AVG · tracked" : p.seasonStats ? "AVG · season" : "AVG"} · {displayAB} AB</div>
+          </div>
+        )}
       </div>
-      <div style={{ marginTop:12, display:"flex", gap:8, flexWrap:"wrap" }}>
+      <div style={{ marginTop:12, display:"flex", gap:8, flexWrap:"wrap", alignItems:"center" }}>
         {p.profile?.willSteal==="Yes" && <Tag label="SB Threat" color={C.green} />}
         {p.profile?.willBunt==="Yes"  && <Tag label="Bunt" color={C.blue} />}
         {p.profile?.firstPitchSwinger==="Yes" && <Tag label="1st Pitch" color={C.gold} />}
         {p.seasonStats && <Tag label={`Season data (${p.seasonStats.source||"Imported"})`} color={C.muted} />}
+        {!selectMode && (
+          <div style={{ flex:1, display:"flex", justifyContent:"flex-end" }}>
+            {confirmDelete ? (
+              <div onClick={e=>e.stopPropagation()} style={{ display:"flex", gap:6 }}>
+                <button onClick={onConfirmDelete} style={btnStyle({ bg:C.accent, color:"#fff", padding:"6px 10px", fontSize:11, fontWeight:700 })}>Delete</button>
+                <button onClick={onCancelDelete} style={btnStyle({ bg:"transparent", color:C.muted, padding:"6px 10px", fontSize:11 })}>Cancel</button>
+              </div>
+            ) : (
+              <button onClick={e=>{e.stopPropagation(); onAskDelete();}} style={{ background:"transparent", border:"none", color:C.muted, cursor:"pointer", fontSize:16, padding:"2px 6px" }}>🗑</button>
+            )}
+          </div>
+        )}
       </div>
     </div>
   );
@@ -1492,8 +1653,11 @@ const inputStyle = () => ({
 // ══════════════════════════════════════════════════════════════
 // TEAM OVERVIEW / GAME DAY SHEET
 // ══════════════════════════════════════════════════════════════
-function TeamReportView({ team, onBack, onSelectPlayer }) {
-  const sorted = [...(team.players||[])].sort((a,b) => (a.order||99)-(b.order||99));
+function TeamReportView({ team, onBack, onSelectPlayer, playerIds }) {
+  const isFiltered = Array.isArray(playerIds) && playerIds.length > 0;
+  const sorted = [...(team.players||[])]
+    .filter(p => !isFiltered || playerIds.includes(p.id))
+    .sort((a,b) => (a.order||99)-(b.order||99));
 
   // Compute per-player stats
   const stats = sorted.map(p => {
@@ -1541,14 +1705,14 @@ function TeamReportView({ team, onBack, onSelectPlayer }) {
       {/* Screen controls */}
       <div className="no-print" style={{ marginBottom:24, display:"flex", gap:12, alignItems:"center" }}>
         <button onClick={onBack} style={{ padding:"10px 20px", borderRadius:8, border:"1px solid #ccc", background:"#fff", cursor:"pointer", fontWeight:600 }}>← Back</button>
-        <button onClick={()=>window.print()} style={{ padding:"10px 22px", borderRadius:8, border:"none", background:"#1d4ed8", color:"#fff", cursor:"pointer", fontWeight:700 }}>🖨 Print Game Day Sheet</button>
+        <button onClick={()=>window.print()} style={{ padding:"10px 22px", borderRadius:8, border:"none", background:"#1d4ed8", color:"#fff", cursor:"pointer", fontWeight:700 }}>🖨 Print {isFiltered ? "Custom Report" : "Game Day Sheet"}</button>
         <span style={{ fontSize:13, color:"#888" }}>Tip: Print → Save as PDF for digital use</span>
       </div>
 
       {/* ── REPORT HEADER ── */}
       <div style={{ display:"flex", justifyContent:"space-between", alignItems:"flex-end", borderBottom:"4px solid #e8312a", paddingBottom:14, marginBottom:24 }}>
         <div>
-          <div style={{ fontSize:11, textTransform:"uppercase", letterSpacing:3, color:"#888", marginBottom:4 }}>Game Day Scouting Sheet</div>
+          <div style={{ fontSize:11, textTransform:"uppercase", letterSpacing:3, color:"#888", marginBottom:4 }}>{isFiltered ? `Custom Scouting Report · ${sorted.length} Player${sorted.length!==1?"s":""}` : "Game Day Scouting Sheet"}</div>
           <div style={{ fontSize:38, fontWeight:900, letterSpacing:-1, lineHeight:1 }}>{team.name}</div>
           <div style={{ fontSize:14, color:"#555", marginTop:6 }}>{sorted.length} hitters scouted · Generated {new Date().toLocaleDateString("en-US",{month:"long",day:"numeric",year:"numeric"})}</div>
         </div>
@@ -2105,7 +2269,8 @@ const getPlayer = (teams, teamId, playerId) => {
   return team?.players?.find(p=>p.id===playerId);
 };
 
-function LiveGameView({ game, teams, onTrackAB, onSwitchSides, onAdvance, onSetIdx, onSub, onAddPlayer, onEndGame, onRefresh, onViewPlayer }) {
+function LiveGameView({ game, teams, onTrackAB, onSwitchSides, onAdvance, onSetIdx, onSub, onAddPlayer, onEndGame, onDeleteGame, onRefresh, onViewPlayer }) {
+  const [confirmDelete, setConfirmDelete] = useState(false);
   const [subTarget, setSubTarget] = useState(null); // { side, slotIdx }
   const teamA = teams.find(t=>t.id===game.teamAId);
   const teamB = teams.find(t=>t.id===game.teamBId);
@@ -2136,6 +2301,14 @@ function LiveGameView({ game, teams, onTrackAB, onSwitchSides, onAdvance, onSetI
         )}
         <button onClick={onRefresh} title="Pull latest from cloud (use if you switched devices)" style={btnStyle({ bg:C.card, color:C.muted, padding:"10px 14px", fontWeight:700 })}>↻ Refresh</button>
         <button onClick={onEndGame} style={btnStyle({ bg:C.accent, color:"#fff", padding:"10px 16px", fontWeight:700 })}>■ End Game</button>
+        {confirmDelete ? (
+          <>
+            <button onClick={onDeleteGame} style={btnStyle({ bg:C.accent, color:"#fff", padding:"10px 14px", fontWeight:700 })}>Confirm Delete</button>
+            <button onClick={()=>setConfirmDelete(false)} style={btnStyle({ bg:"transparent", color:C.muted, padding:"10px 14px" })}>Cancel</button>
+          </>
+        ) : (
+          <button onClick={()=>setConfirmDelete(true)} title="Delete this game entirely" style={{ background:"transparent", border:`1px solid ${C.border}`, color:C.muted, borderRadius:8, padding:"10px 14px", cursor:"pointer", fontSize:18 }}>🗑</button>
+        )}
       </div>
 
       {/* Now Batting */}
