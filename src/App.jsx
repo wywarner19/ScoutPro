@@ -95,12 +95,95 @@ async function sbDeleteGame(id) {
 let _id = Date.now();
 const uid = () => (++_id).toString(36);
 
+// ── App Mode: "live" (synced to your Supabase) vs "sandbox" (local-only, demo data) ──
+const LIVE_PASSCODE = "9833";
+
+const getInitialMode = () => {
+  try {
+    const params = new URLSearchParams(window.location.search);
+    if (params.get("mode") === "live") {
+      localStorage.setItem("scout_mode", "live");
+      return "live";
+    }
+    return localStorage.getItem("scout_mode") || "sandbox";
+  } catch (e) { return "sandbox"; }
+};
+const teamsKey = (mode) => mode==="live" ? "scout_teams" : "sandbox_scout_teams";
+const gamesKey = (mode) => mode==="live" ? "scout_games" : "sandbox_scout_games";
+
+// ── Sandbox demo data ───────────────────────────────────────────
+const makeDemoTeams = () => {
+  const blankProfile = () => ({ willSteal:"No", willBunt:"No", firstPitchSwinger:"No", putAwayPitch:"FB", sprayTend:"Pull", baseRunningNotes:"", scoutNotes:"" });
+  const pitch = (type, zone, result) => ({ id: uid(), type, zone, result });
+
+  const jake = {
+    id: uid(), name:"Jake Torres", number:"7", bats:"L", order:"3", gradYear:"2026",
+    profile: {
+      willSteal:"Maybe", willBunt:"No", firstPitchSwinger:"Yes", putAwayPitch:"FB", sprayTend:"Pull",
+      baseRunningNotes:"Average speed. Won't run much unless given a big jump.",
+      scoutNotes:"Pulls almost everything — sits on fastballs early in the count and yanks them to right field. Vulnerable to soft stuff away, especially changeups down and away. Will chase a get-me-over breaking ball if behind in the count."
+    },
+    seasonStats: { avg:".342", ab:"76", h:"26", "2b":"6", "3b":"1", hr:"4", rbi:"22", bb:"10", k:"14", sb:"3", obp:".410", slg:".566", source:"MaxPreps", importedAt: Date.now() },
+    abs: [
+      { id: uid(), inning:1, outcome:"Double", fieldZone:"RF", pitches:[ pitch("FB",5,"In Play") ], createdAt: Date.now() },
+      { id: uid(), inning:3, outcome:"K", fieldZone:null, pitches:[ pitch("FB",2,"Strike"), pitch("CH",9,"Strike"), pitch("CH",9,"Strike") ], createdAt: Date.now() },
+      { id: uid(), inning:5, outcome:"Ground Out", fieldZone:"Infield", pitches:[ pitch("FB",4,"Foul"), pitch("SL",6,"In Play") ], createdAt: Date.now() },
+    ],
+    createdAt: Date.now()
+  };
+
+  const marcus = {
+    id: uid(), name:"Marcus Webb", number:"14", bats:"R", order:"4", gradYear:"2026",
+    profile: {
+      willSteal:"No", willBunt:"No", firstPitchSwinger:"No", putAwayPitch:"SL", sprayTend:"All Fields",
+      baseRunningNotes:"Below average speed, station-to-station runner.",
+      scoutNotes:"Balanced approach, sprays the ball to all fields with occasional pop to the gaps. Takes a lot of pitches and works deep counts. Put-away pitch is a backdoor slider — he'll take it for a strike more often than not."
+    },
+    seasonStats: { avg:".298", ab:"81", h:"24", "2b":"5", "3b":"0", hr:"3", rbi:"19", bb:"15", k:"18", sb:"1", obp:".398", slg:".457", source:"MaxPreps", importedAt: Date.now() },
+    abs: [
+      { id: uid(), inning:1, outcome:"Walk", fieldZone:null, pitches:[ pitch("FB",1,"Ball"), pitch("SL",3,"Ball"), pitch("FB",7,"Strike"), pitch("CH",1,"Ball"), pitch("SL",2,"Ball") ], createdAt: Date.now() },
+      { id: uid(), inning:4, outcome:"Single", fieldZone:"CF", pitches:[ pitch("FB",5,"Foul"), pitch("FB",5,"In Play") ], createdAt: Date.now() },
+      { id: uid(), inning:6, outcome:"Fly Out", fieldZone:"LF", pitches:[ pitch("SL",8,"Strike"), pitch("SL",8,"In Play") ], createdAt: Date.now() },
+    ],
+    createdAt: Date.now()
+  };
+
+  const diego = {
+    id: uid(), name:"Diego Ramirez", number:"2", bats:"R", order:"1", gradYear:"2027",
+    profile: {
+      willSteal:"Yes", willBunt:"Occasional", firstPitchSwinger:"No", putAwayPitch:"CH", sprayTend:"Oppo",
+      baseRunningNotes:"Plus speed — legitimate stolen base threat anytime he's on. Goes early in the count, doesn't need a big lead.",
+      scoutNotes:"Slap-and-go approach, looks to go the other way and beat out infield hits. Will bunt for a hit against a slow-footed corner infield. First pitch is almost always a take. Chases changeups down in the zone."
+    },
+    seasonStats: { avg:".315", ab:"89", h:"28", "2b":"3", "3b":"2", hr:"0", rbi:"11", bb:"12", k:"9", sb:"18", obp:".403", slg:".382", source:"MaxPreps", importedAt: Date.now() },
+    abs: [
+      { id: uid(), inning:1, outcome:"Single", fieldZone:"RF", pitches:[ pitch("FB",4,"Ball"), pitch("CH",6,"In Play") ], createdAt: Date.now() },
+      { id: uid(), inning:3, outcome:"Sac Bunt", fieldZone:"Infield", pitches:[ pitch("FB",1,"In Play") ], createdAt: Date.now() },
+      { id: uid(), inning:5, outcome:"K", fieldZone:null, pitches:[ pitch("FB",2,"Ball"), pitch("CH",8,"Strike"), pitch("CH",9,"Strike"), pitch("CH",9,"Strike") ], createdAt: Date.now() },
+    ],
+    createdAt: Date.now()
+  };
+
+  return [{
+    id: uid(),
+    name: "Sandbox High School",
+    players: [diego, jake, marcus],
+    createdAt: Date.now()
+  }];
+};
+
 // ══════════════════════════════════════════════════════════════
 // MAIN APP
 // ══════════════════════════════════════════════════════════════
 export default function App() {
-  const [teams, setTeams] = useState(() => load("scout_teams", []));
-  const [games, setGames] = useState(() => load("scout_games", []));
+  const [mode, setMode] = useState(getInitialMode); // "live" | "sandbox"
+  const isLive = mode === "live";
+  const [teams, setTeams] = useState(() => {
+    const stored = load(teamsKey(mode), null);
+    if (stored) return stored;
+    return mode==="live" ? [] : makeDemoTeams();
+  });
+  const [games, setGames] = useState(() => load(gamesKey(mode), []));
   const [view, setView] = useState("home"); // home | team | player | live | report | gamesetup | livegame
   const [activeTeamId, setActiveTeamId] = useState(null);
   const [activePlayerId, setActivePlayerId] = useState(null);
@@ -114,8 +197,8 @@ export default function App() {
 
   const persistGames = (newGames, changedGameId) => {
     setGames(newGames);
-    save("scout_games", newGames);
-    if (changedGameId) {
+    save(gamesKey(mode), newGames);
+    if (changedGameId && isLive) {
       const game = newGames.find(g => g.id === changedGameId);
       const key = `game_${changedGameId}`;
       if (syncTimers.current[key]) clearTimeout(syncTimers.current[key]);
@@ -131,8 +214,9 @@ export default function App() {
     }
   };
 
-  // ── Initial cloud load (runs once) ─────────────────────────────
+  // ── Initial cloud load (runs once, live mode only) ──────────────
   useEffect(() => {
+    if (!isLive) { setSyncStatus("sandbox"); return; }
     (async () => {
       try {
         const [teamRows, gameRows] = await Promise.all([sbFetchTeams(), sbFetchGames()]);
@@ -160,8 +244,8 @@ export default function App() {
 
   const persist = (newTeams, changedTeamId) => {
     setTeams(newTeams);
-    save("scout_teams", newTeams);
-    if (changedTeamId) {
+    save(teamsKey(mode), newTeams);
+    if (changedTeamId && isLive) {
       const team = newTeams.find(t => t.id === changedTeamId);
       if (syncTimers.current[changedTeamId]) clearTimeout(syncTimers.current[changedTeamId]);
       setSyncStatus("syncing");
@@ -250,23 +334,25 @@ export default function App() {
     if (syncTimers.current[teamId]) { clearTimeout(syncTimers.current[teamId]); delete syncTimers.current[teamId]; }
     const next = teams.filter(t => t.id !== teamId);
     setTeams(next);
-    save("scout_teams", next);
-    setSyncStatus("syncing");
-    try {
-      await sbDeleteTeam(teamId);
-      setSyncStatus("synced");
-    } catch (e) {
-      setSyncStatus("error");
+    save(teamsKey(mode), next);
+    if (isLive) {
+      setSyncStatus("syncing");
+      try {
+        await sbDeleteTeam(teamId);
+        setSyncStatus("synced");
+      } catch (e) {
+        setSyncStatus("error");
+      }
     }
     // Also remove any games referencing this team
     const remainingGames = games.filter(g => g.teamAId!==teamId && g.teamBId!==teamId);
     if (remainingGames.length !== games.length) {
       setGames(remainingGames);
-      save("scout_games", remainingGames);
+      save(gamesKey(mode), remainingGames);
       const removed = games.filter(g => g.teamAId===teamId || g.teamBId===teamId);
       for (const g of removed) {
         if (syncTimers.current[`game_${g.id}`]) { clearTimeout(syncTimers.current[`game_${g.id}`]); delete syncTimers.current[`game_${g.id}`]; }
-        try { await sbDeleteGame(g.id); } catch(e){}
+        if (isLive) { try { await sbDeleteGame(g.id); } catch(e){} }
       }
       if (activeGameId && removed.some(g=>g.id===activeGameId)) { setActiveGameId(null); setGameFlow(null); }
     }
@@ -340,6 +426,7 @@ export default function App() {
     setView("home");
   };
   const refreshGame = async (gameId) => {
+    if (!isLive) return;
     setSyncStatus("syncing");
     try {
       const rows = await sbFetchGames();
@@ -360,14 +447,16 @@ export default function App() {
     if (syncTimers.current[`game_${gameId}`]) { clearTimeout(syncTimers.current[`game_${gameId}`]); delete syncTimers.current[`game_${gameId}`]; }
     const next = games.filter(g => g.id !== gameId);
     setGames(next);
-    save("scout_games", next);
+    save(gamesKey(mode), next);
     if (activeGameId === gameId) { setActiveGameId(null); setGameFlow(null); setView("home"); }
-    setSyncStatus("syncing");
-    try {
-      await sbDeleteGame(gameId);
-      setSyncStatus("synced");
-    } catch (e) {
-      setSyncStatus("error");
+    if (isLive) {
+      setSyncStatus("syncing");
+      try {
+        await sbDeleteGame(gameId);
+        setSyncStatus("synced");
+      } catch (e) {
+        setSyncStatus("error");
+      }
     }
   };
 
@@ -410,7 +499,7 @@ export default function App() {
   return (
     <div style={{ background: C.bg, minHeight:"100vh", color: C.text, fontFamily:"'SF Pro Display',-apple-system,BlinkMacSystemFont,sans-serif", userSelect:"none" }}>
       {/* TOP NAV */}
-      <TopBar view={view} team={activeTeam} player={activePlayer} onBack={navBack} onReport={navReport} onTeamReport={navTeamReport} syncStatus={syncStatus} />
+      <TopBar view={view} team={activeTeam} player={activePlayer} onBack={navBack} onReport={navReport} onTeamReport={navTeamReport} syncStatus={syncStatus} isLive={isLive} onUnlock={()=>setModal("unlock")} />
 
       {/* VIEWS */}
       {view==="home"       && (
@@ -500,6 +589,15 @@ export default function App() {
           onClose={()=>setModal(null)}
         />
       )}
+      {modal==="unlock" && (
+        <UnlockModal
+          onUnlock={()=>{
+            try { localStorage.setItem("scout_mode", "live"); } catch(e) {}
+            window.location.reload();
+          }}
+          onClose={()=>setModal(null)}
+        />
+      )}
     </div>
   );
 }
@@ -507,7 +605,7 @@ export default function App() {
 // ══════════════════════════════════════════════════════════════
 // TOP BAR
 // ══════════════════════════════════════════════════════════════
-function TopBar({ view, team, player, onBack, onReport, onTeamReport, syncStatus }) {
+function TopBar({ view, team, player, onBack, onReport, onTeamReport, syncStatus, isLive, onUnlock }) {
   const canReport     = view==="player";
   const canTeamReport = view==="team";
   const syncInfo = {
@@ -516,6 +614,7 @@ function TopBar({ view, team, player, onBack, onReport, onTeamReport, syncStatus
     syncing:    { icon:"⏳", label:"Saving…",     color:C.gold },
     offline:    { icon:"📴", label:"Offline (local only)", color:C.muted },
     error:      { icon:"⚠️", label:"Sync error — saved locally", color:C.accent },
+    sandbox:    { icon:"🏖️", label:"Sandbox · not saved to cloud", color:C.gold },
   }[syncStatus] || { icon:"☁️", label:"", color:C.muted };
   return (
     <div style={{ background: C.surface, borderBottom:`1px solid ${C.border}`, padding:"0 20px", height:56, display:"flex", alignItems:"center", gap:12, position:"sticky", top:0, zIndex:100 }}>
@@ -539,7 +638,8 @@ function TopBar({ view, team, player, onBack, onReport, onTeamReport, syncStatus
       </div>
 
       {/* Sync status */}
-      <div title={syncInfo.label} style={{ display:"flex", alignItems:"center", gap:6, fontSize:11, color:syncInfo.color, fontWeight:600, padding:"4px 10px", borderRadius:20, border:`1px solid ${syncInfo.color}33`, whiteSpace:"nowrap" }}>
+      <div onClick={!isLive ? onUnlock : undefined} title={!isLive ? "Tap to sync to live cloud account" : syncInfo.label}
+        style={{ display:"flex", alignItems:"center", gap:6, fontSize:11, color:syncInfo.color, fontWeight:600, padding:"4px 10px", borderRadius:20, border:`1px solid ${syncInfo.color}33`, whiteSpace:"nowrap", cursor: !isLive ? "pointer" : "default" }}>
         <span style={{ fontSize:13 }}>{syncInfo.icon}</span>
         <span>{syncInfo.label}</span>
       </div>
@@ -1531,6 +1631,42 @@ function PrintCountMatrix({ countData }) {
 // ══════════════════════════════════════════════════════════════
 // MODALS
 // ══════════════════════════════════════════════════════════════
+function UnlockModal({ onUnlock, onClose }) {
+  const [code, setCode] = useState("");
+  const [error, setError] = useState(false);
+
+  const submit = () => {
+    if (code.trim() === LIVE_PASSCODE) {
+      onUnlock();
+    } else {
+      setError(true);
+    }
+  };
+
+  return (
+    <Modal title="🔒 Sync to Live Account" onClose={onClose} onConfirm={submit} confirmLabel="Unlock">
+      <div style={{ fontSize:13, color:C.muted, marginBottom:14, lineHeight:1.6 }}>
+        You're currently in <strong style={{ color:C.gold }}>Sandbox Mode</strong> — everything you do here stays on this device only and is never saved to the cloud.
+        <br/><br/>
+        Enter the coach passcode to switch this device to your live, cloud-synced account.
+      </div>
+      <input
+        type="tel" inputMode="numeric" autoFocus
+        value={code}
+        onChange={e=>{ setCode(e.target.value); setError(false); }}
+        onKeyDown={e=>e.key==="Enter" && submit()}
+        placeholder="Enter passcode"
+        style={{ ...inputStyle(), textAlign:"center", fontSize:24, letterSpacing:6, fontWeight:800 }}
+      />
+      {error && <div style={{ marginTop:10, fontSize:13, color:C.accent, textAlign:"center" }}>Incorrect passcode.</div>}
+      <div style={{ marginTop:14, fontSize:12, color:C.muted, textAlign:"center" }}>
+        This device will switch to live mode and reload. To go back to sandbox later, clear this site's browsing data.
+      </div>
+    </Modal>
+  );
+}
+
+
 function AddTeamModal({ onAdd, onClose }) {
   const [name, setName] = useState("");
   return (
