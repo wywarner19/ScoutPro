@@ -246,6 +246,8 @@ export default function App() {
     }), teamId);
   };
   const deleteTeam = async (teamId) => {
+    // Cancel any pending upsert for this team so it can't recreate the row after deletion
+    if (syncTimers.current[teamId]) { clearTimeout(syncTimers.current[teamId]); delete syncTimers.current[teamId]; }
     const next = teams.filter(t => t.id !== teamId);
     setTeams(next);
     save("scout_teams", next);
@@ -262,7 +264,10 @@ export default function App() {
       setGames(remainingGames);
       save("scout_games", remainingGames);
       const removed = games.filter(g => g.teamAId===teamId || g.teamBId===teamId);
-      for (const g of removed) { try { await sbDeleteGame(g.id); } catch(e){} }
+      for (const g of removed) {
+        if (syncTimers.current[`game_${g.id}`]) { clearTimeout(syncTimers.current[`game_${g.id}`]); delete syncTimers.current[`game_${g.id}`]; }
+        try { await sbDeleteGame(g.id); } catch(e){}
+      }
       if (activeGameId && removed.some(g=>g.id===activeGameId)) { setActiveGameId(null); setGameFlow(null); }
     }
   };
@@ -352,6 +357,7 @@ export default function App() {
     }
   };
   const deleteGame = async (gameId) => {
+    if (syncTimers.current[`game_${gameId}`]) { clearTimeout(syncTimers.current[`game_${gameId}`]); delete syncTimers.current[`game_${gameId}`]; }
     const next = games.filter(g => g.id !== gameId);
     setGames(next);
     save("scout_games", next);
