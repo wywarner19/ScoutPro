@@ -499,7 +499,7 @@ export default function App() {
   return (
     <div style={{ background: C.bg, minHeight:"100vh", color: C.text, fontFamily:"'SF Pro Display',-apple-system,BlinkMacSystemFont,sans-serif", userSelect:"none" }}>
       {/* TOP NAV */}
-      <TopBar view={view} team={activeTeam} player={activePlayer} onBack={navBack} onReport={navReport} onTeamReport={navTeamReport} syncStatus={syncStatus} isLive={isLive} onUnlock={()=>setModal("unlock")} />
+      <TopBar view={view} team={activeTeam} player={activePlayer} onBack={navBack} onReport={navReport} onTeamReport={navTeamReport} syncStatus={syncStatus} isLive={isLive} onUnlock={(which)=>setModal(which)} />
 
       {/* VIEWS */}
       {view==="home"       && (
@@ -598,6 +598,15 @@ export default function App() {
           onClose={()=>setModal(null)}
         />
       )}
+      {modal==="exit" && (
+        <ExitLiveModal
+          onExit={()=>{
+            try { localStorage.setItem("scout_mode", "sandbox"); } catch(e) {}
+            window.location.reload();
+          }}
+          onClose={()=>setModal(null)}
+        />
+      )}
     </div>
   );
 }
@@ -638,8 +647,8 @@ function TopBar({ view, team, player, onBack, onReport, onTeamReport, syncStatus
       </div>
 
       {/* Sync status */}
-      <div onClick={!isLive ? onUnlock : undefined} title={!isLive ? "Tap to sync to live cloud account" : syncInfo.label}
-        style={{ display:"flex", alignItems:"center", gap:6, fontSize:11, color:syncInfo.color, fontWeight:600, padding:"4px 10px", borderRadius:20, border:`1px solid ${syncInfo.color}33`, whiteSpace:"nowrap", cursor: !isLive ? "pointer" : "default" }}>
+      <div onClick={()=>onUnlock(isLive ? "exit" : "unlock")} title={!isLive ? "Tap to sync to live cloud account" : "Tap to leave live mode"}
+        style={{ display:"flex", alignItems:"center", gap:6, fontSize:11, color:syncInfo.color, fontWeight:600, padding:"4px 10px", borderRadius:20, border:`1px solid ${syncInfo.color}33`, whiteSpace:"nowrap", cursor:"pointer" }}>
         <span style={{ fontSize:13 }}>{syncInfo.icon}</span>
         <span>{syncInfo.label}</span>
       </div>
@@ -1661,6 +1670,19 @@ function UnlockModal({ onUnlock, onClose }) {
       {error && <div style={{ marginTop:10, fontSize:13, color:C.accent, textAlign:"center" }}>Incorrect passcode.</div>}
       <div style={{ marginTop:14, fontSize:12, color:C.muted, textAlign:"center" }}>
         This device will switch to live mode and reload. To go back to sandbox later, clear this site's browsing data.
+      </div>
+    </Modal>
+  );
+}
+
+
+function ExitLiveModal({ onExit, onClose }) {
+  return (
+    <Modal title="☁️ Leave Live Mode?" onClose={onClose} onConfirm={onExit} confirmLabel="Switch to Sandbox">
+      <div style={{ fontSize:13, color:C.muted, lineHeight:1.6 }}>
+        This will switch <strong style={{ color:C.text }}>this device</strong> back to <strong style={{ color:C.gold }}>Sandbox Mode</strong> — a local demo workspace that doesn't sync to your real Supabase data.
+        <br/><br/>
+        Your real teams, players, and games stay safe in the cloud — you can always come back to live mode using the special link or the passcode (<strong style={{ color:C.text }}>{LIVE_PASSCODE}</strong>).
       </div>
     </Modal>
   );
