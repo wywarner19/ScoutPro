@@ -629,7 +629,7 @@ function TopBar({ view, team, player, onBack, onReport, onTeamReport, syncStatus
     <div style={{ background: C.surface, borderBottom:`1px solid ${C.border}`, padding:"0 20px", height:56, display:"flex", alignItems:"center", gap:12, position:"sticky", top:0, zIndex:100 }}>
       {/* Logo */}
       <div style={{ display:"flex", alignItems:"center", gap:8, marginRight:8 }}>
-        <div style={{ width:28, height:28, borderRadius:6, background:`linear-gradient(135deg,${C.accent},${C.accentDim})`, display:"flex", alignItems:"center", justifyContent:"center", fontSize:14, fontWeight:900 }}>⚾</div>
+        <img src="icons/icon-192.png" alt="ScoutPro" style={{ width:28, height:28, borderRadius:6, objectFit:"cover" }} />
         <span style={{ fontSize:13, fontWeight:800, letterSpacing:2, color:C.text, textTransform:"uppercase" }}>ScoutPro</span>
       </div>
 
